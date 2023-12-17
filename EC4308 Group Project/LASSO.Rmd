@@ -1,0 +1,185 @@
+---
+title: "LASSO"
+author: "SZ"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## Importing libraries and reading data
+```{r setup, include=TRUE}
+library(glmnet)
+library(broom)
+library(caret)
+combineddata = read.csv("combineddata.csv")
+
+X = model.matrix(sg20y ~ .-Month, data = combineddata)
+X=X[, colnames(X)!= "(Intercept)"] 
+Y = combineddata$sg20y
+```
+
+## Train Test Split
+```{r 1, include=TRUE}
+train = combineddata[2:143, -1]
+train_x = train[,-1]
+train_y = train[,1]
+
+test = combineddata[144:177, -1]  # the test sample indices
+test_x = test[,-1]
+test_y = test[,1]
+
+```
+
+
+## Setting seed and run model on training data
+```{r 2, echo=TRUE,include=TRUE}
+set.seed(5)
+lasso_mod <- glmnet(train_x, train_y, alpha = 1)
+plot(lasso_mod)
+```
+
+## Prepare training data in matrix form to be input to glmnet
+```{r 3,include=TRUE}
+train_x_matrix = model.matrix(~., data=train_x)
+train_x_matrix=train_x_matrix[, colnames(train_x_matrix)!= "(Intercept)"] 
+test_x_matrix = model.matrix(~., data=test_x)
+test_x_matrix=test_x_matrix[, colnames(test_x_matrix)!= "(Intercept)"]
+```
+
+## Use 5-Fold CV when running LASSO using glmnet and default lambda grid
+### Plot 5-Fold CV MSE against Lambda
+```{r 4,include=TRUE,echo=TRUE}
+set.seed(5)
+cv5fold_lasso = cv.glmnet(train_x_matrix, train_y, alpha = 1,nfolds=5)
+plot(cv5fold_lasso)
+plot(cv5fold_lasso$lambda,cv5fold_lasso$cvm, 
+     #  manually pull out lambdas and MSE 
+     ## computed in this CV algorithm
+     main="5-fold CV default settings - LASSO", 
+     xlab="Lambda", ylab="CV MSE")
+```
+
+### Get Lambda with smallest CV MSE with default grid
+```{r 5,include=TRUE}
+minlambda_l = cv5fold_lasso$lambda[which.min(cv5fold_lasso$cvm)]
+minlambda_l
+```
+
+## Get Test Set MSE with chosen lamda above
+```{r 6,include=TRUE}
+lasso_pred <- predict(lasso_mod, s = minlambda_l, newx = test_x_matrix)
+mean((lasso_pred-test_y)^2)
+```
+
+## Use 5-Fold CV when running LASSO using glmnet and Self-defined lambda grid
+## (We narrow down lambda)
+## Plot 5-Fold CV MSE against Lambda
+```{r 7,include=TRUE,echo=TRUE}
+set.seed(5)
+newgrid = seq(0, 5, length.out = 10000)
+cv5fold_lasso_ug= cv.glmnet(train_x_matrix, train_y, alpha = 1, 
+                             lambda=newgrid,nfolds=5)
+plot(cv5fold_lasso_ug$lambda,cv5fold_lasso_ug$cvm, 
+     #  manually pull out lambdas and MSE 
+     ## computed in this CV algorithm
+     main="5-fold CV - LASSO - User's Grid", 
+     xlab="Lambda", ylab="CV MSE")
+```
+
+### Get Min Lambda with smallest CV MSE using  Self-defined lambda grid     
+```{r 8,include=TRUE}
+minlambda_l_ug = cv5fold_lasso_ug$lambda.min
+minlambda_l_ug
+```     
+ 
+### Find the smallest 5-fold CV MSE for Min Lambda
+```{r}
+min(cv5fold_lasso_ug$cvm)
+```
+
+### Find the Standard Error of Lambda
+```{r}
+min(cv5fold_lasso_ug$cvsd)
+```
+
+## Gauge test set performance with fixed window using min lambda
+```{r 9,include=TRUE}
+lasso_pred <- predict(lasso_mod, s = minlambda_l_ug, newx = test_x_matrix)
+mean((lasso_pred-test_y)^2)
+```
+
+### Get 1SE Lambda using  Self-defined lambda grid     
+```{r ,include=TRUE}
+minlambda_l_ug_1se = cv5fold_lasso_ug$lambda.1se
+minlambda_l_ug_1se
+```     
+### Find the CV MSE for 1se Lambda
+```{r}
+cv5fold_lasso_ug$cvm[cv5fold_lasso_ug$lambda == minlambda_l_ug_1se]
+```
+
+## ## Gauge test set performance with fixed window using 1se lambda
+```{r ,include=TRUE}
+lasso_pred_lambda_1se <- predict(lasso_mod, s = minlambda_l_ug_1se, newx = test_x_matrix)
+mean((lasso_pred_lambda_1se-test_y)^2)
+```
+
+# Get coefficient result for LASSO Min Lambda and LASSO 1SE Lambda
+```{r}
+coef = coef(cv5fold_lasso_ug, s=c(minlambda_l_ug,minlambda_l_ug_1se))
+coef
+
+```
+
+# Expanding window forecasting
+
+```{r}
+df = combineddata
+df_predict <- data.frame(Index=numeric(0),sg20y_true=numeric(0), forecastmin =numeric(0), 
+  forecast1se = numeric(0), residmin = numeric(0), resid1se = numeric(0))
+
+for (i in 144:177) {
+  train.ew <- df[2:i,-1] # Creeping training size
+  train.x.ew <-  model.matrix(sg20y ~ ., data = train.ew)[,-1] 
+  train.y.ew <- train.ew$sg20y
+  test.ew <- df[i+1,-1] 
+  test.x.ew <- as.matrix(test.ew[,-1])
+  true_sg20y <- test.ew$sg20y # Single test data
+  
+  set.seed(5)
+  cv5fold.ew <- cv.glmnet(train.x.ew, train.y.ew, alpha=1, lambda = newgrid, nfolds = 5, type.measure = "mse")
+  forecastmin <- predict(cv5fold.ew, newx=test.x.ew, s="lambda.min", type="response")
+  forecast1se <- predict(cv5fold.ew, newx=test.x.ew, s="lambda.1se", type="response")
+  
+  df_predict[nrow(df_predict) + 1,] <- c(i+1,true_sg20y, forecastmin, forecast1se, 
+    forecastmin - true_sg20y, forecast1se - true_sg20y)
+} 
+
+
+cat("Expanding window test MSE (lambda,min):", mean(df_predict$residmin^2),"\n",
+  "Expanding window test MSE (lambda.1se):", mean(df_predict$resid1se^2))
+
+```
+
+
+## CV MSE of selected models using caret
+
+```{r}
+lassogrid = expand.grid("lambda" = cv5fold_lasso_ug$lambda.min, "alpha" = 1)
+set.seed(5)
+lambda_min_cv <- train(
+  x = train_x, y = train_y, 
+  method = "glmnet",
+  trControl = trainControl(method = "cv", number = 5), tuneGrid = lassogrid
+)
+cat("CV MSE of LASSO (lambda.min) = ", mean(lambda_min_cv$resample$RMSE^2), "\n")
+
+lassogrid1se = expand.grid("lambda" = cv5fold_lasso_ug$lambda.1se, "alpha" = 1)
+set.seed(5)
+lambda_1se_cv <- train(
+  x = train_x, y = train_y, 
+  method = "glmnet",
+  trControl = trainControl(method = "cv", number = 5), tuneGrid = lassogrid1se
+)
+cat("CV MSE of LASSO (lambda.1se) = ", mean(lambda_1se_cv$resample$RMSE^2))
+
+```

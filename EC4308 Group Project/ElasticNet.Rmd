@@ -1,0 +1,186 @@
+---
+title: "Elastic Net (2)"
+author: "Aaron"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(pacman)
+p_load(tidyverse, glmnet, hdm, caret)
+```
+
+```{r}
+combineddata <- read.csv("combineddata.csv", stringsAsFactors = FALSE)
+df <- combineddata
+```
+
+## Data splitting
+
+```{r}
+train <- df[2:144, -1]
+train.x <- model.matrix(sg20y ~ ., data = train)[,-1]
+train.y <- train$sg20y
+
+test <- df[145:178, -1]
+test.x <- model.matrix(sg20y ~ ., data = test)[,-1]
+test.y <- test$sg20y
+```
+
+## Elastic Net
+
+```{r}
+ap <- seq.int(0, 1, 0.01)
+
+fn.enet <- function(x) {
+  return(cv.glmnet(train.x, train.y, nfolds = 5, type.measure = "mse", alpha=x))
+}
+
+set.seed(5)
+enet_models <- lapply(ap, fn.enet)
+```
+
+## Optimal alpha based on lowest MSE
+
+```{r}
+cv_err <- unlist(lapply(enet_models, function(x) x$cvm[x$lambda == x$lambda.min]))
+best_alpha <- (which(cv_err == min(cv_err))-1)/100 # Optimal alpha based on lowest MSE
+cat("Optimal alpha:", best_alpha, "\n")
+```
+
+```{r, echo=FALSE}
+elasticnet_ncv <- glmnet(train.x, train.y, alpha = best_alpha)
+plot(elasticnet_ncv)
+```
+
+## Rerun 5-fold CV on train data and gauge test performance (fixed window)
+
+```{r}
+set.seed(5)
+cv5fold <- cv.glmnet(train.x, train.y, nfolds = 5, type.measure = "mse", alpha=best_alpha) # Optimal alpha
+pred.cv5fold <- predict(cv5fold, newx = test.x, s="lambda.min", type="response")
+mse <- mean((test.y-pred.cv5fold)^2)
+cat("Mean-squared error on 34 test obs (min lambda):", mse, "\n")
+
+pred.cv5fold.1se <- predict(cv5fold, newx = test.x, s="lambda.1se", type="response")
+mse.1se <-mean((test.y-pred.cv5fold.1se)^2)
+cat("Mean-squared error on 34 test obs (1SE lambda):", mse.1se, "\n")
+```
+
+## Metrics
+
+```{r}
+coef(cv5fold) # Coefficients
+
+plot(cv5fold)
+plot(cv5fold$lambda, cv5fold$cvm, main="5-fold CV Default Settings - Elastic Net", 
+     xlab="Lambda", ylab="CV MSE")
+
+cat(cv5fold$cvm[which(cv5fold$lambda == cv5fold$lambda.min)], "\n")
+cat(cv5fold$cvm[which(cv5fold$lambda == cv5fold$lambda.1se)])
+```
+
+A possible user-defined grid is between 0 to 1.
+
+```{r}
+set.seed(5)
+cv5fold.plot <- cv.glmnet(train.x, train.y, nfolds = 5, type.measure = "mse", alpha=best_alpha,
+                          lambda = seq(0,1,length.out=10000)) 
+plot(cv5fold.plot$lambda, cv5fold.plot$cvm, main="5-fold CV Refined Grid - Elastic Net", 
+     xlab="Lambda", ylab="CV MSE")
+
+cat(cv5fold.plot$cvm[which(cv5fold.plot$lambda == cv5fold.plot$lambda.min)], "\n")
+cv5fold.plot$lambda.min
+cv5fold.plot$lambda.1se
+```
+
+# Expanding window forecasting
+
+```{r}
+df_predict <- data.frame(Index=numeric(0),sg20y_true=numeric(0),sg20y_predict=numeric(0),
+                         lambda=numeric(0),MSE=numeric(0))
+
+for (i in 144:177) {
+  train.ew <- df[2:i,-1] # Creeping training size
+  train.x.ew <-  model.matrix(sg20y ~ ., data = train.ew)[,-1] 
+  train.y.ew <- train.ew$sg20y
+  test.ew <- df[i+1,-1] 
+  test.x.ew <- as.matrix(test.ew[,-1])
+  true_sg20y <- test.ew$sg20y # Single test data
+  
+  set.seed(5)
+  cv5fold.ew <- cv.glmnet(train.x.ew, train.y.ew, alpha=best_alpha, lambda = seq(0,1,length.out=10000), nfolds = 5,
+    type.measure = "mse")
+  lambda <- cv5fold.ew$lambda.min
+  forecast <- predict(cv5fold.ew, newx=test.x.ew, s="lambda.min", type="response")
+  mse_0 <- cv5fold.ew$cvm[cv5fold.ew$lambda == cv5fold.ew$lambda.min]
+  df_predict[nrow(df_predict) + 1,] <- c(i+1,true_sg20y,forecast, round(lambda,4), round(mse_0,4))
+} 
+
+# Use only df_predict
+# Forecasts are 1 period ahead -> align date == index+1 
+```
+
+## Expanding window forecasting (1SE)
+
+```{r}
+df_predict_1se <- data.frame(Index=numeric(0),sg20y_true=numeric(0),sg20y_predict=numeric(0),
+                             lambda=numeric(0),MSE=numeric(0))
+
+for (i in 144:177) {
+  train.ew <- df[2:i,-1]
+  train.x.ew <-  model.matrix(sg20y ~ ., data = train.ew)[,-1]
+  train.y.ew <- train.ew$sg20y
+  test.ew <- df[i+1,-1]
+  test.x.ew <- as.matrix(test.ew[,-1])
+  true_sg20y <- test.ew$sg20y
+  
+  set.seed(5)
+  cv5fold.ew <- cv.glmnet(train.x.ew, train.y.ew, alpha=best_alpha, lambda = seq(0,1,length.out=10000),
+    nfolds = 5, type.measure = "mse")
+  lambda <- cv5fold.ew$lambda.min
+  forecast <- predict(cv5fold.ew, newx=test.x.ew, s="lambda.1se", type="response")
+  mse_1se <- cv5fold.ew$cvm[cv5fold.ew$lambda == cv5fold.ew$lambda.1se]
+  df_predict_1se[nrow(df_predict_1se) + 1,] <- c(i+1,true_sg20y, forecast, round(lambda,4), round(mse_1se,4))
+} 
+
+# Use only df_predict_1se  
+```
+
+## MSE
+
+```{r}
+df_predict <- df_predict %>% mutate(residual = sg20y_true-sg20y_predict) %>% mutate(resid2 = residual^2)
+test_mse_min <- mean(df_predict$resid2)
+
+df_predict_1se <- df_predict_1se %>% mutate(residual = sg20y_true-sg20y_predict) %>% mutate(resid2 = residual^2)
+test_mse_1se <- mean(df_predict_1se$resid2)
+
+cat("Expanding window test MSE (34 predictions, min. lambda):", round(test_mse_min,4),"\n")
+cat("Expanding window test MSE (34 predictions, 1SE lambda):", round(test_mse_1se,4))
+```
+
+## CV MSE of selected models using caret
+
+```{r}
+enetgrid = expand.grid("lambda" = cv5fold.plot$lambda.min, "alpha" = best_alpha)
+set.seed(5)
+lambda_min_cv <- train(
+  x = train.x, y = train.y, 
+  method = "glmnet",
+  trControl = trainControl(method = "cv", number = 5), tuneGrid = enetgrid
+)
+cat("CV MSE of Elastic Net (lambda.min) = ", mean(lambda_min_cv$resample$RMSE^2))
+
+enetgrid1se = expand.grid("lambda" = cv5fold.plot$lambda.1se, "alpha" = best_alpha)
+set.seed(5)
+lambda_1se_cv <- train(
+  x = train.x, y = train.y, 
+  method = "glmnet",
+  trControl = trainControl(method = "cv", number = 5), tuneGrid = enetgrid1se
+)
+cat("CV MSE of Elastic Net (lambda.1se) = ", mean(lambda_1se_cv$resample$RMSE^2))
+
+```
